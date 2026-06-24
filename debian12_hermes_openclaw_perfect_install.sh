@@ -533,6 +533,36 @@ install_browser_dependencies() {
     log_success "浏览器自动化依赖完成"
 }
 
+setup_docker_official_repository() {
+    if [[ "${OS_ID:-}" != "debian" && "${OS_ID:-}" != "ubuntu" ]]; then
+        log_warning "Docker 官方仓库仅自动配置 Debian/Ubuntu，当前 OS_ID=${OS_ID:-unknown}"
+        return 1
+    fi
+
+    local codename arch repo_url keyring list_file
+    codename="${VERSION_CODENAME:-}"
+    if [ -z "$codename" ] && command -v lsb_release >/dev/null 2>&1; then
+        codename="$(lsb_release -cs)"
+    fi
+    if [ -z "$codename" ]; then
+        log_warning "无法检测系统代号，跳过 Docker 官方仓库配置"
+        return 1
+    fi
+
+    arch="$(dpkg --print-architecture)"
+    repo_url="https://download.docker.com/linux/${OS_ID}"
+    keyring="/etc/apt/keyrings/docker.asc"
+    list_file="/etc/apt/sources.list.d/docker.list"
+
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL "${repo_url}/gpg" -o "$keyring"
+    chmod a+r "$keyring"
+
+    echo "deb [arch=${arch} signed-by=${keyring}] ${repo_url} ${codename} stable" > "$list_file"
+    APT_UPDATED=0
+    apt_update_once
+}
+
 install_docker_support() {
     log_section "步骤 8/9: Docker 沙箱支持"
 
@@ -541,8 +571,18 @@ install_docker_support() {
         return 0
     fi
 
-    if ! command -v docker >/dev/null 2>&1; then
-        log_info "安装 Docker (发行版软件源版本，稳定优先)..."
+    log_info "优先安装 Docker 官方 stable 版本..."
+    if setup_docker_official_repository; then
+        wait_for_apt_locks
+        apt-get remove -y docker.io docker-doc docker-compose podman-docker containerd runc >/dev/null 2>&1 || true
+        if apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
+            log_success "Docker 官方 stable 版本已安装"
+        else
+            log_warning "Docker 官方 stable 版本安装失败，回退发行版软件源版本"
+            apt_install_optional docker.io docker-compose docker-compose-plugin
+        fi
+    else
+        log_warning "Docker 官方仓库配置失败，回退发行版软件源版本"
         apt_install_optional docker.io docker-compose docker-compose-plugin
     fi
 

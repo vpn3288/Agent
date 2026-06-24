@@ -62,6 +62,19 @@ sudo bash agent-install.sh --install all --yes
 
 主脚本会尽量在纯净 Debian/Ubuntu 上补齐下面这些内容。
 
+## 版本策略
+
+脚本按下面的原则选择版本：
+
+- OpenClaw：安装 npm 上的 `openclaw@latest`，失败时回退 OpenClaw 官方安装器。
+- Hermes Agent：优先使用 Hermes 官方安装器；失败时从官方 GitHub 仓库源码安装。
+- Node.js：默认安装 Node.js 24.x，这是当前 LTS 线；OpenClaw 的最低要求是 Node.js 22.19+。
+- Docker：优先使用 Docker 官方 APT stable 仓库安装 Docker CE；失败时回退 Debian/Ubuntu 发行版稳定包。
+- Rust：使用 `rustup` 安装 stable 工具链。
+- uv：使用 Astral 官方安装器安装最新稳定版；失败时再尝试 `pipx`、`pip` 或 `cargo`。
+- pnpm：安装 npm 上的 `pnpm@latest`。
+- apt 依赖：使用当前 Debian/Ubuntu 软件源提供的稳定版本，避免混用大量第三方源破坏系统稳定性。
+
 基础系统工具：
 
 - `sudo`
@@ -158,7 +171,8 @@ AI Agent 通用运行时：
 
 Docker 支持：
 
-- 默认尝试安装发行版软件源里的 Docker
+- 默认优先安装 Docker 官方 APT stable 仓库里的 Docker CE
+- 如果官方仓库不可用，会回退到发行版软件源里的 Docker
 - 启用并启动 Docker 服务
 - 如果使用 `sudo` 用户运行，会尝试把该用户加入 `docker` 组
 
