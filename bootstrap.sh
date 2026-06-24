@@ -1,31 +1,43 @@
-#!/bin/bash
+#!/usr/bin/env bash
 ################################################################################
-# Debian 12 超级精简版启动脚本
-# 用途：在最干净的 Debian 12 上先安装 curl，然后运行主安装脚本
+# Debian/Ubuntu minimal bootstrap
+# Installs curl/ca-certificates if needed, downloads the main installer to a
+# temporary file, then executes it so interactive prompts still work.
 ################################################################################
 
-set -e
+set -Eeuo pipefail
 
-echo "=========================================="
-echo "  Debian 12 超级精简版启动脚本"
-echo "=========================================="
+MAIN_SCRIPT_URL="https://raw.githubusercontent.com/vpn3288/Agent/main/debian12_hermes_openclaw_perfect_install.sh"
+
+echo "============================================================"
+echo "  Debian/Ubuntu AI Agent minimal bootstrap"
+echo "============================================================"
 echo ""
 
-# 检查是否为 root
-if [ "$EUID" -ne 0 ]; then
-    echo "错误：需要 ROOT 权限"
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    echo "错误：需要 root 权限"
     echo "请使用: sudo bash $0"
     exit 1
 fi
 
-echo "步骤 1/2: 安装 curl..."
-apt-get update -qq
-apt-get install -y curl
+export DEBIAN_FRONTEND=noninteractive
+export APT_LISTCHANGES_FRONTEND=none
+
+echo "步骤 1/2: 准备 curl 和证书..."
+apt-get update
+apt-get install -y curl ca-certificates
 
 echo "步骤 2/2: 下载并运行主安装脚本..."
-curl -fsSL https://raw.githubusercontent.com/vpn3288/Agent/main/debian12_hermes_openclaw_perfect_install.sh | bash
+tmp_script="$(mktemp)"
+trap 'rm -f "$tmp_script"' EXIT
+curl -fsSL "$MAIN_SCRIPT_URL" -o "$tmp_script"
+if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    bash "$tmp_script" "$@" < /dev/tty
+else
+    bash "$tmp_script" "$@"
+fi
 
 echo ""
-echo "=========================================="
-echo "  启动脚本执行完成！"
-echo "=========================================="
+echo "============================================================"
+echo "  bootstrap 执行完成"
+echo "============================================================"

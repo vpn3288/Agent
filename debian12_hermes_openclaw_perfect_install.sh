@@ -1,740 +1,1159 @@
-#!/bin/bash
+#!/usr/bin/env bash
 ################################################################################
-# Debian 12 完美安装脚本 - Hermes Agent & OpenClaw 双兼容版
-# 版本: v6.0 - 环境变量立即生效 + 四重保障 uv 安装
-# 适用: 最干净的 Debian 12 (远程 DD 安装)
-# 特性: 100% 自动化，静默安装，自动跳过已安装项，最新稳定版
+# Debian/Ubuntu AI Agent stable installer
+# Covers OpenClaw, Hermes Agent, and a reusable base environment for other agents.
+#
+# Flow:
+#   1. Prepare all system dependencies first on clean Debian/Ubuntu.
+#   2. Verify language/runtime/tooling support.
+#   3. Ask whether to install OpenClaw/Hermes immediately or show manual steps.
 ################################################################################
 
-set -e
+set -Eeuo pipefail
 
-# 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# 日志函数
+AGENT_INSTALLER_VERSION="v7.0"
+AGENT_NODE_MAJOR="${AGENT_NODE_MAJOR:-24}"
+AGENT_LOG_FILE="${AGENT_LOG_FILE:-/var/log/agent-perfect-install.log}"
+AGENT_WORKDIR="${AGENT_WORKDIR:-/opt/ai-agents}"
+AGENT_APT_UPGRADE="${AGENT_APT_UPGRADE:-0}"
+AGENT_INSTALL_DOCKER="${AGENT_INSTALL_DOCKER:-1}"
+AGENT_INSTALL_BROWSER="${AGENT_INSTALL_BROWSER:-1}"
+
+INSTALL_TARGET="menu"
+ASSUME_YES=0
+MANUAL_ONLY=0
+DEPS_ONLY=0
+LOGGING_INITIALIZED=0
+APT_UPDATED=0
+
+# Keep system Node/Python ahead of any nvm/asdf paths. This avoids mixed Node
+# installs breaking OpenClaw after npm global installation.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin:$HOME/.cargo/bin"
+export DEBIAN_FRONTEND=noninteractive
+export APT_LISTCHANGES_FRONTEND=none
+
 log_info() {
-    echo -e "${CYAN}[INFO]${NC} $1"
+    echo -e "${CYAN}[INFO]${NC} $*"
 }
 
 log_success() {
-    echo -e "${GREEN}[✓]${NC} $1"
+    echo -e "${GREEN}[OK]${NC} $*"
 }
 
 log_warning() {
-    echo -e "${YELLOW}[⚠]${NC} $1"
+    echo -e "${YELLOW}[WARN]${NC} $*"
 }
 
 log_error() {
-    echo -e "${RED}[✗]${NC} $1"
+    echo -e "${RED}[ERROR]${NC} $*" >&2
 }
 
 log_section() {
     echo ""
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${BLUE}  $1${NC}"
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}============================================================${NC}"
+    echo -e "${BLUE}  $*${NC}"
+    echo -e "${BLUE}============================================================${NC}"
     echo ""
 }
 
-# 检测系统信息
-detect_system() {
-    log_section "系统信息检测"
-    
-    # 尝试从多个来源检测系统信息
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS_NAME="${NAME:-Unknown}"
-        OS_VERSION="${VERSION_ID:-Unknown}"
-        OS_CODENAME="${VERSION_CODENAME:-Unknown}"
-    else
-        OS_NAME=$(lsb_release -is 2>/dev/null || echo "Unknown")
-        OS_VERSION=$(lsb_release -rs 2>/dev/null || echo "Unknown")
-        OS_CODENAME=$(lsb_release -cs 2>/dev/null || echo "Unknown")
+init_logging() {
+    if [ "$LOGGING_INITIALIZED" -eq 1 ]; then
+        return 0
     fi
-    
-    ARCH=$(uname -m)
-    
-    log_info "操作系统: $OS_NAME $OS_VERSION ($OS_CODENAME)"
-    log_info "架构: $ARCH"
-    log_info "内核: $(uname -r)"
-    log_info "用户: $(whoami)"
-    
-    # 验证 Debian 12（宽松检查）
-    if [[ "$OS_NAME" == *"Debian"* ]] && [[ "$OS_VERSION" == "12"* ]]; then
-        log_success "检测到 Debian 12 系统"
-    elif [[ "$OS_NAME" == "Unknown" ]]; then
-        log_warning "无法检测系统版本，假设为 Debian 12 继续安装"
-        log_info "如果不是 Debian 12，请按 Ctrl+C 取消"
-        sleep 3
-    else
-        log_warning "本脚本专为 Debian 12 优化，当前系统: $OS_NAME $OS_VERSION"
-        log_info "继续安装可能会遇到兼容性问题"
-        sleep 3
-    fi
-    
-    log_success "系统检测完成"
+
+    mkdir -p "$(dirname "$AGENT_LOG_FILE")"
+    touch "$AGENT_LOG_FILE"
+    chmod 0644 "$AGENT_LOG_FILE"
+    exec > >(tee -a "$AGENT_LOG_FILE") 2>&1
+    LOGGING_INITIALIZED=1
 }
 
-# ROOT 环境检测和优化
-setup_root_environment() {
-    log_section "ROOT 环境配置"
-    
-    if [ "$EUID" -ne 0 ]; then
-        log_error "本脚本需要 ROOT 权限运行"
-        log_info "请使用: sudo bash $0"
+error_handler() {
+    local exit_code=$?
+    local line_no=${1:-unknown}
+    log_error "脚本在第 ${line_no} 行失败，退出码: ${exit_code}"
+    log_error "完整日志: ${AGENT_LOG_FILE}"
+    exit "$exit_code"
+}
+
+retry() {
+    local attempts=$1
+    local delay=$2
+    shift 2
+
+    local n=1
+    until "$@"; do
+        if [ "$n" -ge "$attempts" ]; then
+            return 1
+        fi
+        log_warning "命令失败，${delay}s 后重试 (${n}/${attempts}): $*"
+        sleep "$delay"
+        n=$((n + 1))
+    done
+}
+
+run_bash_with_retry() {
+    local attempts=$1
+    local delay=$2
+    local script=$3
+    retry "$attempts" "$delay" bash -o pipefail -c "$script"
+}
+
+append_once() {
+    local file=$1
+    local line=$2
+
+    mkdir -p "$(dirname "$file")"
+    touch "$file"
+    if ! grep -Fqx "$line" "$file"; then
+        printf '%s\n' "$line" >> "$file"
+    fi
+}
+
+append_block_once() {
+    local file=$1
+    local marker=$2
+    local block=$3
+
+    mkdir -p "$(dirname "$file")"
+    touch "$file"
+    if ! grep -Fq "$marker" "$file"; then
+        printf '\n%s\n' "$block" >> "$file"
+    fi
+}
+
+command_version() {
+    local cmd=$1
+    if command -v "$cmd" >/dev/null 2>&1; then
+        "$cmd" --version 2>&1 | head -n 1 || true
+    else
+        echo "未安装"
+    fi
+}
+
+has_tty() {
+    [ -r /dev/tty ] && [ -w /dev/tty ]
+}
+
+require_root() {
+    if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+        log_error "需要 root 权限运行。请使用: sudo bash $0"
         exit 1
     fi
-    
-    log_success "ROOT 权限确认"
-    
-    # 设置非交互式前端
+}
+
+detect_system() {
+    log_section "系统检测"
+
+    if [ ! -f /etc/os-release ]; then
+        log_error "无法读取 /etc/os-release。本脚本仅支持 Debian/Ubuntu 系。"
+        exit 1
+    fi
+
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_NAME="${PRETTY_NAME:-${NAME:-unknown}}"
+    OS_VERSION="${VERSION_ID:-unknown}"
+    OS_LIKE="${ID_LIKE:-}"
+    ARCH="$(uname -m)"
+
+    log_info "操作系统: ${OS_NAME}"
+    log_info "版本 ID: ${OS_VERSION}"
+    log_info "架构: ${ARCH}"
+    log_info "内核: $(uname -r)"
+    log_info "当前用户: $(whoami)"
+
+    case "$OS_ID" in
+        debian|ubuntu)
+            log_success "检测到受支持的 Debian/Ubuntu 系统"
+            ;;
+        *)
+            if [[ "$OS_LIKE" == *"debian"* ]]; then
+                log_warning "检测到 Debian-like 系统 (${OS_ID})，继续使用 apt 流程"
+            elif [ "${AGENT_FORCE:-0}" = "1" ]; then
+                log_warning "当前系统不是 Debian/Ubuntu，但 AGENT_FORCE=1，继续执行"
+            else
+                log_error "当前系统不是 Debian/Ubuntu。若确认兼容，可设置 AGENT_FORCE=1 后重试。"
+                exit 1
+            fi
+            ;;
+    esac
+
+    if [[ "$ARCH" != "x86_64" && "$ARCH" != "aarch64" && "$ARCH" != "arm64" ]]; then
+        log_warning "当前架构 ${ARCH} 不是常见服务器架构，部分上游二进制包可能不可用"
+    fi
+}
+
+setup_noninteractive_apt() {
+    log_section "非交互安装环境"
+
+    echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections || true
+    export NEEDRESTART_MODE=a
     export DEBIAN_FRONTEND=noninteractive
     export APT_LISTCHANGES_FRONTEND=none
-    
-    # 禁用交互式配置
-    echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections
-    
-    log_success "非交互式环境配置完成"
+
+    log_success "APT 非交互模式已启用"
 }
 
-# 更新系统并安装基础工具
+wait_for_apt_locks() {
+    if ! command -v fuser >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local locks=(
+        /var/lib/dpkg/lock
+        /var/lib/dpkg/lock-frontend
+        /var/lib/apt/lists/lock
+        /var/cache/apt/archives/lock
+    )
+    local waited=0
+    while fuser "${locks[@]}" >/dev/null 2>&1; do
+        if [ "$waited" -ge 300 ]; then
+            log_error "等待 apt/dpkg 锁超过 300 秒"
+            return 1
+        fi
+        log_info "等待 apt/dpkg 锁释放..."
+        sleep 5
+        waited=$((waited + 5))
+    done
+}
+
+apt_update_once() {
+    if [ "$APT_UPDATED" -eq 1 ]; then
+        return 0
+    fi
+
+    wait_for_apt_locks
+    log_info "更新 APT 软件源..."
+    retry 3 5 apt-get update
+    APT_UPDATED=1
+}
+
+apt_install_required() {
+    local packages=("$@")
+    if [ "${#packages[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    apt_update_once
+    wait_for_apt_locks
+
+    log_info "安装必需软件包: ${packages[*]}"
+    if retry 2 5 apt-get install -y "${packages[@]}"; then
+        return 0
+    fi
+
+    log_warning "批量安装失败，改为逐个安装以定位缺失包"
+    local pkg
+    for pkg in "${packages[@]}"; do
+        wait_for_apt_locks
+        retry 3 5 apt-get install -y "$pkg" || {
+            log_error "必需软件包安装失败: ${pkg}"
+            return 1
+        }
+    done
+}
+
+apt_install_optional() {
+    local packages=("$@")
+    local pkg
+
+    apt_update_once
+    for pkg in "${packages[@]}"; do
+        wait_for_apt_locks
+        if apt-get install -y "$pkg"; then
+            log_success "可选软件包已安装: ${pkg}"
+        else
+            log_warning "可选软件包不可用或安装失败，已跳过: ${pkg}"
+        fi
+    done
+}
+
+apt_install_one_of() {
+    local label=$1
+    shift
+
+    apt_update_once
+
+    local pkg
+    for pkg in "$@"; do
+        wait_for_apt_locks
+        if apt-get install -y "$pkg"; then
+            log_success "${label}: 使用 ${pkg}"
+            return 0
+        fi
+    done
+
+    log_warning "${label}: 未找到可安装的候选包: $*"
+    return 1
+}
+
 install_base_system() {
-    log_section "步骤 1/8: 基础系统工具"
-    
-    log_info "更新软件源..."
-    apt-get update -qq 2>&1 | grep -v "^Get:" || true
-    
-    log_info "安装基础系统工具..."
-    apt-get install -y -qq \
-        sudo \
-        curl \
-        wget \
-        ca-certificates \
-        gnupg \
-        lsb-release \
-        apt-transport-https \
-        software-properties-common \
-        dirmngr \
-        gpg-agent \
-        git \
-        git-lfs \
-        unzip \
-        zip \
-        tar \
-        gzip \
-        bzip2 \
-        xz-utils \
-        procps \
-        net-tools \
-        iputils-ping \
-        dnsutils \
-        vim \
-        nano \
-        htop \
-        screen \
-        tmux \
-        rsync \
-        jq \
-        tree \
-        less \
-        man-db \
-        locales \
-        tzdata \
-        2>&1 | grep -E "Setting up|Processing" || true
-    
-    # 配置 locale
-    if ! locale -a | grep -q "en_US.utf8"; then
-        log_info "配置 locale..."
-        echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
-        locale-gen en_US.UTF-8 >/dev/null 2>&1
-        update-locale LANG=en_US.UTF-8 >/dev/null 2>&1
+    log_section "步骤 1/9: 基础系统软件"
+
+    apt_update_once
+    if [ "$AGENT_APT_UPGRADE" = "1" ]; then
+        log_info "AGENT_APT_UPGRADE=1，执行系统升级..."
+        wait_for_apt_locks
+        retry 2 10 apt-get dist-upgrade -y
     fi
-    
-    # 配置时区（默认 UTC）
-    if [ ! -f /etc/timezone ]; then
-        log_info "配置时区..."
-        ln -sf /usr/share/zoneinfo/UTC /etc/localtime
-        echo "UTC" > /etc/timezone
+
+    apt_install_required \
+        sudo curl wget ca-certificates gnupg lsb-release apt-transport-https \
+        software-properties-common dirmngr gpg-agent git unzip zip tar gzip \
+        bzip2 xz-utils procps psmisc net-tools iputils-ping dnsutils locales \
+        tzdata openssh-client openssh-server openssl rsync jq less nano vim htop \
+        screen tmux
+
+    apt_install_optional \
+        git-lfs tree man-db bash-completion needrestart unattended-upgrades
+
+    if ! locale -a 2>/dev/null | grep -qi '^en_US\.utf8$'; then
+        log_info "配置 en_US.UTF-8 locale..."
+        if ! grep -Fq "en_US.UTF-8 UTF-8" /etc/locale.gen 2>/dev/null; then
+            echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+        fi
+        locale-gen en_US.UTF-8 || true
+        update-locale LANG=en_US.UTF-8 || true
     fi
-    
-    log_success "基础系统工具安装完成"
+
+    log_success "基础系统软件完成"
 }
 
-# 安装编译工具和开发依赖
 install_build_tools() {
-    log_section "步骤 2/8: 编译工具和开发依赖"
-    
-    log_info "安装编译工具链..."
-    apt-get install -y -qq \
-        build-essential \
-        gcc \
-        g++ \
-        make \
-        cmake \
-        autoconf \
-        automake \
-        libtool \
-        pkg-config \
-        libssl-dev \
-        libffi-dev \
-        libsqlite3-dev \
-        libbz2-dev \
-        libreadline-dev \
-        libncurses5-dev \
-        libncursesw5-dev \
-        liblzma-dev \
-        zlib1g-dev \
-        libgdbm-dev \
-        libnss3-dev \
-        libxml2-dev \
-        libxmlsec1-dev \
-        tk-dev \
-        uuid-dev \
-        libgmp-dev \
-        libmpfr-dev \
-        libmpc-dev \
-        2>&1 | grep -E "Setting up|Processing" || true
-    
-    # 验证 GCC
-    GCC_VERSION=$(gcc --version | head -n1 | awk '{print $NF}')
-    log_success "GCC 版本: $GCC_VERSION"
+    log_section "步骤 2/9: 编译工具和开发头文件"
+
+    apt_install_required \
+        build-essential gcc g++ make cmake autoconf automake libtool pkg-config \
+        libssl-dev libffi-dev libsqlite3-dev libbz2-dev libreadline-dev \
+        libncurses-dev libncursesw5-dev liblzma-dev zlib1g-dev libgdbm-dev \
+        libnss3-dev libxml2-dev libxmlsec1-dev tk-dev uuid-dev libgmp-dev \
+        libmpfr-dev libmpc-dev libcurl4-openssl-dev libyaml-dev
+
+    apt_install_optional \
+        clang llvm gdb strace ltrace valgrind libjpeg-dev libpng-dev \
+        libsndfile1 portaudio19-dev
+
+    log_success "GCC: $(command_version gcc)"
 }
 
-# 安装 Python 3.11+ (Hermes 需要)
-install_python() {
-    log_section "步骤 3/8: Python 3.11+ 环境"
-    
-    log_info "安装 Python 3.11+ 及工具..."
-    apt-get install -y -qq \
-        python3 \
-        python3-pip \
-        python3-venv \
-        python3-dev \
-        python3-setuptools \
-        python3-wheel \
-        python3-distutils \
-        python3-apt \
-        2>&1 | grep -E "Setting up|Processing" || true
-    
-    # 验证 Python 版本
-    PYTHON_VERSION=$(python3 --version | awk '{print $2}')
-    PYTHON_MAJOR=$(echo $PYTHON_VERSION | cut -d. -f1)
-    PYTHON_MINOR=$(echo $PYTHON_VERSION | cut -d. -f2)
-    
-    log_info "Python 版本: $PYTHON_VERSION"
-    
-    if [ "$PYTHON_MAJOR" -lt 3 ] || ([ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -lt 11 ]); then
-        log_error "Python 版本过低（需要 3.11+），当前: $PYTHON_VERSION"
-        log_info "Debian 12 应该自带 Python 3.11，请检查系统"
+install_python_stack() {
+    log_section "步骤 3/9: Python / pipx / uv 基础"
+
+    apt_install_required \
+        python3 python3-pip python3-venv python3-dev python3-setuptools \
+        python3-wheel python3-apt
+
+    apt_install_optional pipx python3-distutils python3-full
+
+    if ! command -v python >/dev/null 2>&1; then
+        ln -sf /usr/bin/python3 /usr/local/bin/python
+    fi
+
+    log_success "Python: $(command_version python3)"
+    log_success "pip: $(python3 -m pip --version 2>/dev/null || echo 'pip 未就绪')"
+}
+
+node_meets_openclaw_requirement() {
+    if ! command -v node >/dev/null 2>&1; then
+        return 1
+    fi
+
+    local version major minor
+    version="$(node --version | sed 's/^v//')"
+    major="${version%%.*}"
+    minor="$(echo "$version" | cut -d. -f2)"
+
+    if [ "$major" -gt 24 ]; then
+        return 0
+    fi
+    if [ "$major" -eq 24 ]; then
+        return 0
+    fi
+    if [ "$major" -eq 22 ] && [ "$minor" -ge 19 ]; then
+        return 0
+    fi
+    return 1
+}
+
+install_nodejs_stack() {
+    log_section "步骤 4/9: Node.js / npm / pnpm"
+
+    if [[ "$AGENT_NODE_MAJOR" != "24" && "$AGENT_NODE_MAJOR" != "22" ]]; then
+        log_warning "AGENT_NODE_MAJOR=${AGENT_NODE_MAJOR} 不在推荐值 24/22 内，自动改为 24"
+        AGENT_NODE_MAJOR=24
+    fi
+
+    if node_meets_openclaw_requirement; then
+        log_success "Node.js 已满足 OpenClaw 要求: $(node --version)"
+    else
+        log_info "安装 Node.js ${AGENT_NODE_MAJOR}.x (OpenClaw 推荐 Node 24，兼容 Node 22.19+)"
+        run_bash_with_retry 3 8 "curl -fsSL https://deb.nodesource.com/setup_${AGENT_NODE_MAJOR}.x | bash -"
+        apt_install_required nodejs
+        hash -r
+    fi
+
+    if ! node_meets_openclaw_requirement; then
+        log_error "Node.js 版本仍不满足要求: $(command_version node)"
         exit 1
     fi
-    
-    # 创建 python 符号链接（如果不存在）
-    if ! command -v python &>/dev/null; then
-        ln -sf /usr/bin/python3 /usr/bin/python
-        log_info "创建 python -> python3 符号链接"
+
+    npm config set prefix /usr/local >/dev/null
+    npm config set fund false >/dev/null || true
+    npm config set audit false >/dev/null || true
+    npm config set update-notifier false >/dev/null || true
+
+    log_success "Node.js: $(node --version)"
+    log_success "npm: $(npm --version)"
+
+    if command -v corepack >/dev/null 2>&1; then
+        corepack enable || true
     fi
-    
-    # 升级 pip 到最新版
-    log_info "升级 pip 到最新版..."
-    python3 -m pip install --upgrade pip setuptools wheel --quiet 2>&1 | tail -1 || true
-    
-    PIP_VERSION=$(python3 -m pip --version | awk '{print $2}')
-    log_success "pip 版本: $PIP_VERSION"
+
+    if ! command -v pnpm >/dev/null 2>&1; then
+        log_info "安装 pnpm..."
+        retry 3 5 npm install -g pnpm@latest
+        hash -r
+    fi
+
+    if command -v pnpm >/dev/null 2>&1; then
+        log_success "pnpm: $(pnpm --version)"
+    else
+        log_warning "pnpm 未安装成功；OpenClaw npm 安装不依赖 pnpm，源码构建时可能需要"
+    fi
 }
 
-# 安装 Node.js 24 LTS (OpenClaw 需要)
-install_nodejs() {
-    log_section "步骤 4/8: Node.js 24 LTS 环境"
-    
-    # 检查是否已安装 Node.js 24
-    if command -v node &>/dev/null; then
-        NODE_VERSION=$(node --version | sed 's/v//')
-        NODE_MAJOR=$(echo $NODE_VERSION | cut -d. -f1)
-        
-        if [ "$NODE_MAJOR" -ge 24 ]; then
-            log_success "Node.js $NODE_VERSION 已安装，跳过"
-            return 0
-        else
-            log_warning "检测到旧版本 Node.js $NODE_VERSION，将升级到 v24"
-        fi
-    fi
-    
-    log_info "安装 Node.js 24 LTS..."
-    
-    # 添加 NodeSource 仓库
-    curl -fsSL https://deb.nodesource.com/setup_24.x | bash - >/dev/null 2>&1
-    
-    # 安装 Node.js
-    apt-get install -y -qq nodejs 2>&1 | grep -E "Setting up|Processing" || true
-    
-    # 验证安装
-    NODE_VERSION=$(node --version)
-    NPM_VERSION=$(npm --version)
-    
-    log_success "Node.js 版本: $NODE_VERSION"
-    log_success "npm 版本: $NPM_VERSION"
-    
-    # 安装 pnpm (OpenClaw 推荐)
-    log_info "安装 pnpm 包管理器..."
-    npm install -g pnpm@latest --silent 2>&1 | tail -1 || true
-    
-    PNPM_VERSION=$(pnpm --version 2>/dev/null || echo "未安装")
-    if [ "$PNPM_VERSION" != "未安装" ]; then
-        log_success "pnpm 版本: $PNPM_VERSION"
-    fi
-    
-    # 配置 npm 全局目录（避免权限问题）
-    mkdir -p /root/.npm-global
-    npm config set prefix '/root/.npm-global'
-    
-    if ! grep -q "NPM_CONFIG_PREFIX" /root/.bashrc; then
-        echo 'export NPM_CONFIG_PREFIX=/root/.npm-global' >> /root/.bashrc
-        echo 'export PATH=/root/.npm-global/bin:$PATH' >> /root/.bashrc
-    fi
-    
-    export NPM_CONFIG_PREFIX=/root/.npm-global
-    export PATH=/root/.npm-global/bin:$PATH
-}
-
-# 安装 Rust 和 uv (Hermes 需要)
 install_rust_and_uv() {
-    log_section "步骤 5/8: Rust 和 uv 包管理器"
-    
-    # 检查是否已安装 Rust
-    if command -v rustc &>/dev/null; then
-        RUST_VERSION=$(rustc --version | awk '{print $2}')
-        log_success "Rust $RUST_VERSION 已安装"
+    log_section "步骤 5/9: Rust / uv / Python 3.11 托管运行时"
+
+    if ! command -v rustc >/dev/null 2>&1; then
+        log_info "安装 Rust stable minimal..."
+        run_bash_with_retry 3 8 "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal"
+    fi
+
+    if [ -f "$HOME/.cargo/env" ]; then
+        # shellcheck disable=SC1090
+        . "$HOME/.cargo/env"
+    fi
+    export PATH="$HOME/.cargo/bin:$PATH"
+
+    if command -v rustc >/dev/null 2>&1; then
+        log_success "Rust: $(rustc --version)"
     else
-        log_info "安装 Rust (最新稳定版)..."
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal >/dev/null 2>&1
-        
-        # 加载 Rust 环境
-        source /root/.cargo/env
-        
-        RUST_VERSION=$(rustc --version | awk '{print $2}')
-        log_success "Rust 版本: $RUST_VERSION"
+        log_warning "Rust 未安装成功；大部分预编译包仍可继续使用"
     fi
-    
-    # 确保 Rust 环境变量在 bashrc 中
-    if ! grep -q "cargo/env" /root/.bashrc; then
-        echo 'source $HOME/.cargo/env' >> /root/.bashrc
+
+    if ! command -v uv >/dev/null 2>&1; then
+        log_info "安装 uv (官方安装脚本)..."
+        if ! run_bash_with_retry 3 8 "curl -LsSf https://astral.sh/uv/install.sh | sh"; then
+            log_warning "官方 uv 安装失败，尝试 pipx/pip/cargo 备用方案"
+        fi
     fi
-    
-    # 加载 Rust 环境
-    export PATH="/root/.cargo/bin:$PATH"
-    
-    # 安装 uv (Hermes 推荐的 Python 包管理器) - 四重保障机制
-    if command -v uv &>/dev/null; then
-        UV_VERSION=$(uv --version | awk '{print $2}')
-        log_success "uv $UV_VERSION 已安装"
-    else
-        log_info "安装 uv 包管理器（四重保障机制）..."
-        
-        # 确保 Rust 环境已加载
-        if [ -f /root/.cargo/env ]; then
-            source /root/.cargo/env
-        fi
-        export PATH="/root/.cargo/bin:$PATH"
-        
-        # 方法1: 使用官方安装脚本（推荐，最快）
-        log_info "方法1: 使用官方安装脚本..."
-        if curl -LsSf https://astral.sh/uv/install.sh | sh 2>&1 | tee /tmp/uv_install.log | grep -q "uv"; then
-            # 强制重新加载环境变量（多次确保生效）
-            source /root/.cargo/env 2>/dev/null || true
-            export PATH="/root/.cargo/bin:$PATH"
-            source ~/.bashrc 2>/dev/null || true
-            
-            # 等待文件系统同步
-            sleep 1
-            
-            # 多次尝试检测 uv
-            for i in {1..3}; do
-                if [ -f /root/.cargo/bin/uv ]; then
-                    chmod +x /root/.cargo/bin/uv
-                    export PATH="/root/.cargo/bin:$PATH"
-                    
-                    if /root/.cargo/bin/uv --version &>/dev/null; then
-                        UV_VERSION=$(/root/.cargo/bin/uv --version | awk '{print $2}')
-                        log_success "uv 版本: $UV_VERSION (官方安装脚本)"
-                        
-                        # 创建符号链接确保全局可用
-                        ln -sf /root/.cargo/bin/uv /usr/local/bin/uv 2>/dev/null || true
-                        
-                        return 0
-                    fi
-                fi
-                sleep 1
-            done
-            
-            log_warning "官方脚本执行成功，但 uv 命令未立即生效，尝试备用方案..."
-        else
-            log_warning "官方安装脚本执行失败，尝试备用方案..."
-        fi
-        
-        # 方法2: 使用 pip 安装 uv（快速备用方案，预编译二进制）
-        log_info "方法2: 使用 pip 安装 uv（预编译二进制，10-30秒）..."
-        if python3 -m pip install uv --quiet 2>&1 | tail -1; then
-            # 强制重新加载环境变量
-            source /root/.cargo/env 2>/dev/null || true
-            export PATH="/root/.cargo/bin:$PATH"
-            source ~/.bashrc 2>/dev/null || true
-            
-            # 等待安装完成
-            sleep 1
-            
-            # 多次尝试检测
-            for i in {1..3}; do
-                if command -v uv &>/dev/null; then
-                    UV_VERSION=$(uv --version | awk '{print $2}')
-                    log_success "uv 版本: $UV_VERSION (通过 pip 安装)"
-                    
-                    # 创建符号链接
-                    ln -sf $(which uv) /usr/local/bin/uv 2>/dev/null || true
-                    
-                    return 0
-                fi
-                sleep 1
-            done
-        fi
-        
-        log_warning "pip 安装 uv 失败，尝试 cargo 编译方案..."
-        
-        # 方法3: 使用 cargo 编译安装（最可靠但最慢，2-5分钟）
-        if command -v cargo &>/dev/null; then
-            log_info "方法3: 使用 cargo 编译安装 uv（需要 2-5 分钟）..."
-            log_info "正在从源码编译，请耐心等待..."
-            
-            if cargo install uv 2>&1 | tee /tmp/cargo_uv_install.log | grep -E "Installing|Compiling|Finished"; then
-                # 强制重新加载环境（多次确保生效）
-                source /root/.cargo/env 2>/dev/null || true
-                export PATH="/root/.cargo/bin:$PATH"
-                source ~/.bashrc 2>/dev/null || true
-                
-                # 等待编译完成
-                sleep 2
-                
-                # 多次尝试检测
-                for i in {1..3}; do
-                    if [ -f /root/.cargo/bin/uv ]; then
-                        chmod +x /root/.cargo/bin/uv
-                        export PATH="/root/.cargo/bin:$PATH"
-                        
-                        if /root/.cargo/bin/uv --version &>/dev/null; then
-                            UV_VERSION=$(/root/.cargo/bin/uv --version | awk '{print $2}')
-                            log_success "uv 版本: $UV_VERSION (通过 cargo 编译)"
-                            
-                            # 创建符号链接
-                            ln -sf /root/.cargo/bin/uv /usr/local/bin/uv 2>/dev/null || true
-                            
-                            return 0
-                        fi
-                    fi
-                    sleep 1
-                done
-            fi
-        fi
-        
-        # 方法4: pip 降级方案（保底）
-        log_info "方法4: 尝试 pip 降级安装 uv（保底方案）..."
-        if python3 -m pip install --upgrade --force-reinstall uv 2>&1 | tail -5; then
-            # 强制重新加载环境变量
-            source /root/.cargo/env 2>/dev/null || true
-            export PATH="/root/.cargo/bin:$PATH"
-            source ~/.bashrc 2>/dev/null || true
-            
-            sleep 2
-            
-            if command -v uv &>/dev/null; then
-                UV_VERSION=$(uv --version | awk '{print $2}')
-                log_success "uv 版本: $UV_VERSION (通过 pip 强制重装)"
-                
-                # 创建符号链接
-                ln -sf $(which uv) /usr/local/bin/uv 2>/dev/null || true
-                
-                return 0
-            fi
-        fi
-        
-        # 所有方法都失败
-        log_warning "uv 安装失败（四种方法均失败），将使用 pip 作为 Hermes 的包管理器"
-        log_info "这不影响 Hermes 功能，只是包管理速度会稍慢"
-        log_info "安装 Hermes 时请使用: python3 -m pip install -e \".[all]\""
+
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+    hash -r || true
+
+    if ! command -v uv >/dev/null 2>&1 && command -v pipx >/dev/null 2>&1; then
+        pipx install uv || pipx upgrade uv || true
+        export PATH="$HOME/.local/bin:$PATH"
+        hash -r || true
     fi
+
+    if ! command -v uv >/dev/null 2>&1; then
+        python3 -m pip install --user --break-system-packages uv || true
+        export PATH="$HOME/.local/bin:$PATH"
+        hash -r || true
+    fi
+
+    if ! command -v uv >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
+        cargo install uv || true
+        export PATH="$HOME/.cargo/bin:$PATH"
+        hash -r || true
+    fi
+
+    if ! command -v uv >/dev/null 2>&1; then
+        log_error "uv 安装失败。Hermes Agent 需要 uv 才能稳定创建 Python 3.11 环境。"
+        exit 1
+    fi
+
+    ln -sf "$(command -v uv)" /usr/local/bin/uv
+    log_success "uv: $(uv --version)"
+
+    log_info "预安装 uv 托管 Python 3.11..."
+    uv python install 3.11 || log_warning "uv 托管 Python 3.11 预安装失败；Hermes 安装时会再次尝试"
 }
 
-# 安装额外的运行时依赖
 install_runtime_dependencies() {
-    log_section "步骤 6/8: 运行时依赖和工具"
-    
-    log_info "安装运行时依赖..."
-    
-    # 数据库和存储
-    apt-get install -y -qq \
-        sqlite3 \
-        libsqlite3-0 \
-        redis-tools \
-        2>&1 | grep -E "Setting up|Processing" || true
-    
-    # 网络和安全工具
-    apt-get install -y -qq \
-        openssh-client \
-        openssh-server \
-        openssl \
-        certbot \
-        2>&1 | grep -E "Setting up|Processing" || true
-    
-    # 媒体处理工具 (可选，但推荐)
-    apt-get install -y -qq \
-        ffmpeg \
-        imagemagick \
-        graphicsmagick \
-        2>&1 | grep -E "Setting up|Processing" || true
-    
-    # 文档和文本处理
-    apt-get install -y -qq \
-        pandoc \
-        ripgrep \
-        fd-find \
-        bat \
-        2>&1 | grep -E "Setting up|Processing" || true
-    
-    # Docker (可选，用于沙箱)
-    if ! command -v docker &>/dev/null; then
-        log_info "安装 Docker..."
-        curl -fsSL https://get.docker.com | sh >/dev/null 2>&1
-        systemctl enable docker >/dev/null 2>&1
-        systemctl start docker >/dev/null 2>&1
-        
-        DOCKER_VERSION=$(docker --version | awk '{print $3}' | sed 's/,//')
-        log_success "Docker 版本: $DOCKER_VERSION"
-    else
-        DOCKER_VERSION=$(docker --version | awk '{print $3}' | sed 's/,//')
-        log_success "Docker $DOCKER_VERSION 已安装"
+    log_section "步骤 6/9: AI Agent 运行时依赖"
+
+    apt_install_required \
+        sqlite3 redis-tools ffmpeg imagemagick graphicsmagick pandoc ripgrep \
+        fd-find bat xclip xauth xvfb dbus-x11
+
+    apt_install_optional \
+        postgresql-client redis-server certbot \
+        shellcheck shfmt graphviz
+
+    apt_install_one_of "MySQL 客户端" default-mysql-client mysql-client || true
+    apt_install_one_of "音频运行库" libasound2t64 libasound2 || true
+    apt_install_one_of "Chromium 浏览器" chromium chromium-browser || true
+
+    if command -v fdfind >/dev/null 2>&1 && ! command -v fd >/dev/null 2>&1; then
+        ln -sf "$(command -v fdfind)" /usr/local/bin/fd
     fi
-    
-    log_success "运行时依赖安装完成"
+    if command -v batcat >/dev/null 2>&1 && ! command -v bat >/dev/null 2>&1; then
+        ln -sf "$(command -v batcat)" /usr/local/bin/bat
+    fi
+
+    log_success "运行时依赖完成"
 }
 
-# 配置 Git
-configure_git() {
-    log_section "步骤 7/8: Git 配置"
-    
-    GIT_VERSION=$(git --version | awk '{print $3}')
-    log_info "Git 版本: $GIT_VERSION"
-    
-    # 配置 Git（如果尚未配置）
-    if ! git config --global user.name &>/dev/null; then
-        git config --global user.name "Hermes & OpenClaw User"
-        log_info "设置 Git 用户名: Hermes & OpenClaw User"
+install_browser_dependencies() {
+    log_section "步骤 7/9: 浏览器自动化依赖"
+
+    apt_install_required \
+        libnss3 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
+        libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
+        libatspi2.0-0 libglib2.0-0 libx11-6 libxcb1 libxext6 libxrender1 \
+        libxtst6 libx11-xcb1 libxshmfence1 fonts-liberation fonts-noto-color-emoji
+
+    apt_install_one_of "ATK 运行库" libatk1.0-0t64 libatk1.0-0 || true
+    apt_install_one_of "ATK Bridge 运行库" libatk-bridge2.0-0t64 libatk-bridge2.0-0 || true
+    apt_install_one_of "CUPS 运行库" libcups2t64 libcups2 || true
+    apt_install_one_of "GTK 3 运行库" libgtk-3-0t64 libgtk-3-0 || true
+
+    log_success "浏览器自动化依赖完成"
+}
+
+install_docker_support() {
+    log_section "步骤 8/9: Docker 沙箱支持"
+
+    if [ "$AGENT_INSTALL_DOCKER" != "1" ]; then
+        log_warning "AGENT_INSTALL_DOCKER!=1，跳过 Docker"
+        return 0
     fi
-    
-    if ! git config --global user.email &>/dev/null; then
+
+    if ! command -v docker >/dev/null 2>&1; then
+        log_info "安装 Docker (发行版软件源版本，稳定优先)..."
+        apt_install_optional docker.io docker-compose docker-compose-plugin
+    fi
+
+    if command -v docker >/dev/null 2>&1; then
+        if command -v systemctl >/dev/null 2>&1 && systemctl list-system-units >/dev/null 2>&1; then
+            systemctl enable docker >/dev/null 2>&1 || true
+            systemctl start docker >/dev/null 2>&1 || true
+        else
+            service docker start >/dev/null 2>&1 || true
+        fi
+
+        if getent group docker >/dev/null 2>&1; then
+            if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+                usermod -aG docker "$SUDO_USER" || true
+                log_info "已将 ${SUDO_USER} 加入 docker 组；重新登录后生效"
+            fi
+        fi
+
+        log_success "Docker: $(docker --version 2>/dev/null || echo '已安装')"
+    else
+        log_warning "Docker 未安装成功；Hermes/OpenClaw 基础安装可继续，Docker 后端需手动补装"
+    fi
+}
+
+configure_git_and_permissions() {
+    log_section "步骤 9/9: Git / 权限 / 稳定性优化"
+
+    mkdir -p "$AGENT_WORKDIR" /usr/local/bin /usr/local/share/ai-agents "$HOME/.local/bin"
+    chmod 0755 "$AGENT_WORKDIR" /usr/local/bin /usr/local/share/ai-agents "$HOME/.local/bin"
+
+    if ! git config --global user.name >/dev/null 2>&1; then
+        git config --global user.name "AI Agent User"
+    fi
+    if ! git config --global user.email >/dev/null 2>&1; then
         git config --global user.email "agent@localhost"
-        log_info "设置 Git 邮箱: agent@localhost"
     fi
-    
-    # 配置 Git 性能优化
     git config --global core.compression 0
     git config --global http.postBuffer 524288000
     git config --global http.lowSpeedLimit 0
     git config --global http.lowSpeedTime 999999
-    
-    # 配置 Git LFS
     git lfs install >/dev/null 2>&1 || true
-    
-    log_success "Git 配置完成"
-}
 
-# 最终环境配置
-finalize_environment() {
-    log_section "步骤 8/8: 环境变量和路径配置"
-    
-    # 确保所有路径都在 bashrc 中
-    cat >> /root/.bashrc << 'EOF'
-
-# ============================================================================
-# Hermes & OpenClaw 环境变量
-# ============================================================================
-
-# Rust 和 Cargo
-export PATH="$HOME/.cargo/bin:$PATH"
-
-# Node.js 全局包
-export NPM_CONFIG_PREFIX=$HOME/.npm-global
-export PATH=$HOME/.npm-global/bin:$PATH
-
-# Python 用户包
-export PATH="$HOME/.local/bin:$PATH"
-
-# Hermes 和 OpenClaw 别名
-alias hermes="$HOME/hermes-agent/hermes"
-alias openclaw="openclaw"
-
-# 编辑器
-export EDITOR=nano
-export VISUAL=nano
-
+    cat > /etc/profile.d/ai-agent-env.sh <<'EOF'
+# AI Agent runtime environment
+export PATH="/usr/local/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+export EDITOR="${EDITOR:-nano}"
+export VISUAL="${VISUAL:-nano}"
+export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
 EOF
-    
-    # 重新加载环境
-    source /root/.bashrc
-    
-    log_success "环境配置完成"
-}
+    chmod 0644 /etc/profile.d/ai-agent-env.sh
 
-# 显示安装总结
-show_summary() {
-    log_section "安装完成！"
-    
-    echo -e "${GREEN}✓ 所有依赖和软件已成功安装${NC}"
-    echo ""
-    echo -e "${CYAN}已安装的核心组件:${NC}"
-    echo ""
-    
-    # Python
-    PYTHON_VERSION=$(python3 --version | awk '{print $2}')
-    echo -e "  ${GREEN}•${NC} Python: ${YELLOW}$PYTHON_VERSION${NC}"
-    
-    # Node.js
-    NODE_VERSION=$(node --version)
-    echo -e "  ${GREEN}•${NC} Node.js: ${YELLOW}$NODE_VERSION${NC}"
-    
-    # npm
-    NPM_VERSION=$(npm --version)
-    echo -e "  ${GREEN}•${NC} npm: ${YELLOW}$NPM_VERSION${NC}"
-    
-    # pnpm
-    if command -v pnpm &>/dev/null; then
-        PNPM_VERSION=$(pnpm --version)
-        echo -e "  ${GREEN}•${NC} pnpm: ${YELLOW}$PNPM_VERSION${NC}"
-    fi
-    
-    # Rust
-    if command -v rustc &>/dev/null; then
-        RUST_VERSION=$(rustc --version | awk '{print $2}')
-        echo -e "  ${GREEN}•${NC} Rust: ${YELLOW}$RUST_VERSION${NC}"
-    fi
-    
-    # uv
-    if command -v uv &>/dev/null; then
-        UV_VERSION=$(uv --version | awk '{print $2}')
-        echo -e "  ${GREEN}•${NC} uv: ${YELLOW}$UV_VERSION${NC}"
-    fi
-    
-    # Git
-    GIT_VERSION=$(git --version | awk '{print $3}')
-    echo -e "  ${GREEN}•${NC} Git: ${YELLOW}$GIT_VERSION${NC}"
-    
-    # Docker
-    if command -v docker &>/dev/null; then
-        DOCKER_VERSION=$(docker --version | awk '{print $3}' | sed 's/,//')
-        echo -e "  ${GREEN}•${NC} Docker: ${YELLOW}$DOCKER_VERSION${NC}"
-    fi
-    
-    # GCC
-    GCC_VERSION=$(gcc --version | head -n1 | awk '{print $NF}')
-    echo -e "  ${GREEN}•${NC} GCC: ${YELLOW}$GCC_VERSION${NC}"
-    
-    echo ""
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${CYAN}  下一步操作${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
-    echo -e "${YELLOW}1. 重新加载环境变量:${NC}"
-    echo -e "   ${GREEN}source ~/.bashrc${NC}"
-    echo ""
-    echo -e "${YELLOW}2. 安装 Hermes Agent:${NC}"
-    echo -e "   ${GREEN}cd ~${NC}"
-    echo -e "   ${GREEN}git clone https://github.com/NousResearch/hermes-agent.git${NC}"
-    echo -e "   ${GREEN}cd hermes-agent${NC}"
-    echo -e "   ${GREEN}uv venv .venv --python 3.11${NC}"
-    echo -e "   ${GREEN}source .venv/bin/activate${NC}"
-    echo -e "   ${GREEN}uv pip install -e \".[all]\"${NC}"
-    echo -e "   ${GREEN}ln -sf ~/hermes-agent/hermes ~/.local/bin/hermes${NC}"
-    echo ""
-    echo -e "${YELLOW}3. 安装 OpenClaw:${NC}"
-    echo -e "   ${GREEN}npm install -g openclaw@latest${NC}"
-    echo -e "   ${GREEN}# 或使用 pnpm:${NC}"
-    echo -e "   ${GREEN}pnpm add -g openclaw@latest${NC}"
-    echo ""
-    echo -e "${YELLOW}4. 启动 Hermes:${NC}"
-    echo -e "   ${GREEN}hermes${NC}"
-    echo -e "   ${GREEN}# 或运行初始化向导:${NC}"
-    echo -e "   ${GREEN}hermes setup${NC}"
-    echo ""
-    echo -e "${YELLOW}5. 启动 OpenClaw:${NC}"
-    echo -e "   ${GREEN}openclaw onboard --install-daemon${NC}"
-    echo ""
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${CYAN}  一键安装命令（复制粘贴即可）${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
-    echo -e "${GREEN}# 安装 Hermes Agent${NC}"
-    echo -e "${YELLOW}cd ~ && git clone https://github.com/NousResearch/hermes-agent.git && cd hermes-agent && uv venv .venv --python 3.11 && source .venv/bin/activate && uv pip install -e \".[all]\" && ln -sf ~/hermes-agent/hermes ~/.local/bin/hermes && source ~/.bashrc${NC}"
-    echo ""
-    echo -e "${GREEN}# 安装 OpenClaw${NC}"
-    echo -e "${YELLOW}npm install -g openclaw@latest${NC}"
-    echo ""
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${CYAN}  学习资源${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
-    echo -e "  ${GREEN}•${NC} Hermes 官方文档: ${BLUE}https://hermes-agent.nousresearch.com/docs/${NC}"
-    echo -e "  ${GREEN}•${NC} Hermes GitHub: ${BLUE}https://github.com/NousResearch/hermes-agent${NC}"
-    echo -e "  ${GREEN}•${NC} OpenClaw 官方文档: ${BLUE}https://docs.openclaw.ai${NC}"
-    echo -e "  ${GREEN}•${NC} OpenClaw GitHub: ${BLUE}https://github.com/openclaw/openclaw${NC}"
-    echo ""
-    echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
-}
+    append_block_once "$HOME/.bashrc" "# AI Agent runtime environment" '# AI Agent runtime environment
+export PATH="/usr/local/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+export EDITOR="${EDITOR:-nano}"
+export VISUAL="${VISUAL:-nano}"
+export UV_LINK_MODE="${UV_LINK_MODE:-copy}"'
 
-# 主函数
-main() {
-    clear
-    
-    echo -e "${BLUE}"
-    cat << "EOF"
-╔═══════════════════════════════════════════════════════════════════╗
-║                                                                   ║
-║   Debian 12 完美安装脚本 v6.0                                     ║
-║   Hermes Agent & OpenClaw 双兼容版                               ║
-║                                                                   ║
-║   • 100% 自动化安装                                               ║
-║   • ROOT 环境优化                                                 ║
-║   • 最新稳定版                                                    ║
-║   • 自动跳过已安装项                                              ║
-║   • 环境变量立即生效                                              ║
-║   • 四重保障 uv 安装                                              ║
-║                                                                   ║
-╚═══════════════════════════════════════════════════════════════════╝
+    cat > /etc/security/limits.d/99-ai-agent.conf <<'EOF'
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
 EOF
-    echo -e "${NC}"
-    
-    sleep 2
-    
-    # 执行安装步骤
+    chmod 0644 /etc/security/limits.d/99-ai-agent.conf
+
+    cat > /etc/sysctl.d/99-ai-agent.conf <<'EOF'
+fs.file-max = 2097152
+fs.inotify.max_user_watches = 1048576
+fs.inotify.max_user_instances = 1024
+net.core.somaxconn = 65535
+EOF
+    sysctl --system >/dev/null 2>&1 || true
+
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        usermod -aG sudo "$SUDO_USER" || true
+        log_info "已确认 ${SUDO_USER} 具备 sudo 组权限"
+    fi
+
+    log_success "Git/权限/稳定性优化完成"
+}
+
+write_doctor_script() {
+    cat > /usr/local/bin/agent-env-doctor <<'EOF'
+#!/usr/bin/env bash
+set -u
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+check_command() {
+    local cmd=$1
+    if command -v "$cmd" >/dev/null 2>&1; then
+        printf "%bOK%b %-12s %s\n" "$GREEN" "$NC" "$cmd" "$($cmd --version 2>&1 | head -n 1 || true)"
+    else
+        printf "%bMISS%b %-12s 未安装\n" "$RED" "$NC" "$cmd"
+    fi
+}
+
+echo "AI Agent 环境检查"
+echo "============================================================"
+for cmd in curl wget git gcc make cmake python3 pip3 uv node npm pnpm rg ffmpeg docker; do
+    check_command "$cmd"
+done
+echo "============================================================"
+
+if command -v node >/dev/null 2>&1; then
+    node_version="$(node --version | sed 's/^v//')"
+    node_major="${node_version%%.*}"
+    node_minor="$(echo "$node_version" | cut -d. -f2)"
+    if [ "$node_major" -ge 24 ] || { [ "$node_major" -eq 22 ] && [ "$node_minor" -ge 19 ]; }; then
+        printf "%bOK%b OpenClaw Node requirement satisfied: v%s\n" "$GREEN" "$NC" "$node_version"
+    else
+        printf "%bWARN%b OpenClaw needs Node 24 recommended or Node 22.19+: v%s\n" "$YELLOW" "$NC" "$node_version"
+    fi
+fi
+
+if command -v hermes >/dev/null 2>&1; then
+    check_command hermes
+else
+    printf "%bMISS%b hermes      未安装；可运行 install_hermes.sh 或主脚本菜单安装\n" "$YELLOW" "$NC"
+fi
+
+if command -v openclaw >/dev/null 2>&1; then
+    check_command openclaw
+else
+    printf "%bMISS%b openclaw    未安装；可运行 install_openclaw.sh 或主脚本菜单安装\n" "$YELLOW" "$NC"
+fi
+EOF
+    chmod +x /usr/local/bin/agent-env-doctor
+}
+
+prepare_all_dependencies() {
+    require_root
     detect_system
-    setup_root_environment
+    setup_noninteractive_apt
     install_base_system
     install_build_tools
-    install_python
-    install_nodejs
+    install_python_stack
+    install_nodejs_stack
     install_rust_and_uv
     install_runtime_dependencies
-    configure_git
-    finalize_environment
-    
-    # 显示总结
-    show_summary
-    
-    log_success "脚本执行完成！"
+    install_browser_dependencies
+    install_docker_support
+    configure_git_and_permissions
+    write_doctor_script
+
+    log_success "所有基础依赖、软件、运行时支持和稳定性优化已完成"
 }
 
-# 执行主函数
-main "$@"
+manual_openclaw_steps() {
+    cat <<'EOF'
+
+OpenClaw 手动安装步骤
+============================================================
+依赖已经准备完成。你可以任选一种方式手动安装:
+
+1. 官方安装器:
+   curl -fsSL https://openclaw.ai/install.sh | bash
+   # 只安装本体、不立即 onboarding:
+   curl -fsSL https://openclaw.ai/install.sh | bash -s -- --no-onboard
+
+2. npm 全局安装:
+   npm install -g openclaw@latest
+
+3. 安装后初始化:
+   openclaw onboard --install-daemon
+   openclaw gateway --port 18789 --verbose
+
+验证:
+   openclaw --version
+   agent-env-doctor
+============================================================
+EOF
+}
+
+manual_hermes_steps() {
+    cat <<'EOF'
+
+Hermes Agent 手动安装步骤
+============================================================
+依赖已经准备完成。推荐使用官方安装器安装 Hermes 本体:
+
+   curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup
+
+如需源码/开发模式，再使用下面的手动方式:
+
+   cd ~
+   git clone https://github.com/NousResearch/hermes-agent.git
+   cd hermes-agent
+   uv python install 3.11
+   uv venv .venv --python 3.11
+   source .venv/bin/activate
+   uv pip install -e ".[all]"
+   ln -sf "$PWD/.venv/bin/hermes" /usr/local/bin/hermes
+
+验证:
+   hermes --version
+   hermes doctor
+   agent-env-doctor
+============================================================
+EOF
+}
+
+manual_other_agent_steps() {
+    cat <<'EOF'
+
+其他 AI Agent 通用环境说明
+============================================================
+本脚本已准备通用 agent 环境:
+
+   - Debian/Ubuntu 基础工具和编译链
+   - Python 3 / uv / uv-managed Python 3.11
+   - Node.js 24 默认运行时，兼容 OpenClaw 的 Node 22.19+ 要求
+   - npm / pnpm
+   - ripgrep / fd / bat / jq / ffmpeg / ImageMagick / pandoc
+   - browser automation 运行库和可选 Chromium
+   - Docker 沙箱支持
+   - Git/LFS、PATH、limits、sysctl 稳定性优化
+
+新增其他 agent 时，建议遵循同一流程:
+
+   1. 先运行本脚本完成依赖准备。
+   2. 再安装 agent 本体。
+   3. 最后运行 agent 自带 doctor/verify 命令和 agent-env-doctor。
+============================================================
+EOF
+}
+
+prompt_yes_no() {
+    local prompt=$1
+    local default=${2:-yes}
+    local answer
+
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        return 0
+    fi
+
+    if ! has_tty; then
+        log_warning "当前不是交互式终端，默认不立即安装。需要自动安装请加 --yes。"
+        return 1
+    fi
+
+    if [ "$default" = "yes" ]; then
+        read -r -p "${prompt} [Y/n]: " answer < /dev/tty
+        answer="${answer:-Y}"
+    else
+        read -r -p "${prompt} [y/N]: " answer < /dev/tty
+        answer="${answer:-N}"
+    fi
+
+    case "$answer" in
+        y|Y|yes|YES|Yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+install_openclaw_agent() {
+    log_section "安装 OpenClaw"
+
+    if ! node_meets_openclaw_requirement; then
+        log_error "Node.js 不满足 OpenClaw 要求，请先重新运行依赖准备"
+        exit 1
+    fi
+
+    npm config set prefix /usr/local >/dev/null
+    log_info "使用 npm 安装 OpenClaw latest..."
+    if ! retry 3 8 npm install -g openclaw@latest; then
+        log_warning "npm 安装 OpenClaw 失败，尝试官方安装器"
+        run_bash_with_retry 2 8 "curl -fsSL https://openclaw.ai/install.sh | bash -s -- --no-onboard"
+    fi
+
+    hash -r || true
+    if ! command -v openclaw >/dev/null 2>&1; then
+        log_error "OpenClaw 安装后未找到 openclaw 命令"
+        manual_openclaw_steps
+        exit 1
+    fi
+
+    log_success "OpenClaw: $(openclaw --version 2>/dev/null || echo '已安装')"
+    cat <<'EOF'
+
+下一步:
+   openclaw onboard --install-daemon
+   openclaw gateway --port 18789 --verbose
+EOF
+}
+
+install_hermes_from_source() {
+    local repo_dir="${HERMES_DIR:-$HOME/hermes-agent}"
+    mkdir -p "$(dirname "$repo_dir")"
+
+    if [ -d "$repo_dir/.git" ]; then
+        log_info "检测到已有 Hermes 仓库，尝试更新: ${repo_dir}"
+        if ! git -C "$repo_dir" pull --ff-only origin main; then
+            log_warning "Hermes 仓库无法 fast-forward 更新，继续使用当前工作副本"
+        fi
+    else
+        log_info "克隆 Hermes Agent 仓库..."
+        git clone https://github.com/NousResearch/hermes-agent.git "$repo_dir"
+    fi
+
+    cd "$repo_dir"
+
+    log_info "创建 Python 3.11 虚拟环境..."
+    uv python install 3.11 || true
+    rm -rf .venv
+    uv venv .venv --python 3.11
+
+    # shellcheck disable=SC1091
+    . .venv/bin/activate
+
+    log_info "安装 Hermes Agent 完整依赖..."
+    uv pip install --upgrade pip setuptools wheel
+    if ! uv pip install -e ".[all]"; then
+        log_warning "Hermes [all] 额外依赖安装失败，尝试安装核心包"
+        uv pip install -e .
+    fi
+
+    if [ "$AGENT_INSTALL_BROWSER" = "1" ] && [ -x ".venv/bin/playwright" ]; then
+        log_info "安装 Playwright Chromium 浏览器资源..."
+        .venv/bin/playwright install chromium || log_warning "Playwright 浏览器资源下载失败，可稍后手动运行: playwright install chromium"
+    fi
+
+    if [ -x "$repo_dir/.venv/bin/hermes" ]; then
+        ln -sf "$repo_dir/.venv/bin/hermes" /usr/local/bin/hermes
+    elif [ -x "$repo_dir/hermes" ]; then
+        ln -sf "$repo_dir/hermes" /usr/local/bin/hermes
+    else
+        log_warning "未找到 Hermes 可执行文件，请检查安装日志"
+    fi
+}
+
+install_hermes_agent() {
+    log_section "安装 Hermes Agent"
+
+    if ! command -v uv >/dev/null 2>&1; then
+        log_error "uv 未安装，无法稳定安装 Hermes Agent"
+        exit 1
+    fi
+
+    local hermes_flags="--skip-setup"
+    if [ "$AGENT_INSTALL_BROWSER" != "1" ]; then
+        hermes_flags="${hermes_flags} --skip-browser"
+    fi
+
+    log_info "使用 Hermes 官方安装器安装本体..."
+    if ! run_bash_with_retry 2 8 "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- ${hermes_flags}"; then
+        log_warning "Hermes 官方安装器失败，回退到源码安装"
+        install_hermes_from_source
+    fi
+
+    if [ -x "$HOME/.local/bin/hermes" ] && ! command -v hermes >/dev/null 2>&1; then
+        ln -sf "$HOME/.local/bin/hermes" /usr/local/bin/hermes
+        hash -r || true
+    fi
+
+    hash -r || true
+    if command -v hermes >/dev/null 2>&1; then
+        log_success "Hermes: $(hermes --version 2>/dev/null || echo '已安装')"
+    else
+        log_error "Hermes 安装后未找到 hermes 命令"
+        manual_hermes_steps
+        exit 1
+    fi
+
+    cat <<'EOF'
+
+下一步:
+   hermes setup
+   hermes doctor
+EOF
+}
+
+handle_target_install() {
+    local target=$1
+
+    case "$target" in
+        deps)
+            manual_openclaw_steps
+            manual_hermes_steps
+            manual_other_agent_steps
+            ;;
+        openclaw)
+            if [ "$MANUAL_ONLY" -eq 1 ]; then
+                manual_openclaw_steps
+            elif prompt_yes_no "依赖已全部安装完成，是否马上安装 OpenClaw？" yes; then
+                install_openclaw_agent
+            else
+                manual_openclaw_steps
+            fi
+            ;;
+        hermes)
+            if [ "$MANUAL_ONLY" -eq 1 ]; then
+                manual_hermes_steps
+            elif prompt_yes_no "依赖已全部安装完成，是否马上安装 Hermes Agent？" yes; then
+                install_hermes_agent
+            else
+                manual_hermes_steps
+            fi
+            ;;
+        all)
+            if [ "$MANUAL_ONLY" -eq 1 ]; then
+                manual_openclaw_steps
+                manual_hermes_steps
+            else
+                if prompt_yes_no "依赖已全部安装完成，是否马上安装 OpenClaw？" yes; then
+                    install_openclaw_agent
+                else
+                    manual_openclaw_steps
+                fi
+                if prompt_yes_no "是否马上安装 Hermes Agent？" yes; then
+                    install_hermes_agent
+                else
+                    manual_hermes_steps
+                fi
+            fi
+            ;;
+        other)
+            manual_other_agent_steps
+            ;;
+        *)
+            log_error "未知安装目标: ${target}"
+            exit 1
+            ;;
+    esac
+}
+
+show_final_menu() {
+    log_section "依赖准备完成，选择下一步"
+
+    if ! has_tty; then
+        log_warning "非交互模式下不会弹出菜单。"
+        manual_openclaw_steps
+        manual_hermes_steps
+        manual_other_agent_steps
+        return 0
+    fi
+
+    cat <<'EOF'
+请选择要马上安装的 Agent:
+
+  1) OpenClaw
+  2) Hermes Agent
+  3) OpenClaw + Hermes Agent
+  4) 只显示手动安装步骤
+  5) 其他 AI Agent 通用环境说明
+  0) 退出
+EOF
+
+    local choice
+    read -r -p "请输入选项 [1-5/0]: " choice < /dev/tty
+    case "${choice:-4}" in
+        1) handle_target_install openclaw ;;
+        2) handle_target_install hermes ;;
+        3) handle_target_install all ;;
+        4) handle_target_install deps ;;
+        5) handle_target_install other ;;
+        0) log_info "已退出；依赖环境仍已准备完成" ;;
+        *) log_warning "无效选项，显示手动安装步骤"; handle_target_install deps ;;
+    esac
+}
+
+show_summary() {
+    log_section "环境摘要"
+
+    echo -e "${GREEN}基础环境已完成。可随时运行:${NC}"
+    echo "   agent-env-doctor"
+    echo ""
+    echo -e "${CYAN}核心版本:${NC}"
+    echo "   Python:  $(command_version python3)"
+    echo "   uv:      $(command_version uv)"
+    echo "   Node.js: $(command_version node)"
+    echo "   npm:     $(command_version npm)"
+    echo "   pnpm:    $(command_version pnpm)"
+    echo "   Git:     $(command_version git)"
+    echo "   rg:      $(command_version rg)"
+    echo "   ffmpeg:  $(command_version ffmpeg)"
+    echo "   Docker:  $(command_version docker)"
+    echo ""
+    echo "日志文件: ${AGENT_LOG_FILE}"
+}
+
+show_help() {
+    cat <<EOF
+用法:
+  sudo bash $0 [选项]
+
+选项:
+  --install openclaw|hermes|all|deps|other
+      依赖准备完成后处理指定目标。默认显示菜单。
+
+  --yes, -y
+      非交互确认，适合自动化安装。
+
+  --manual
+      只准备依赖并显示手动安装步骤，不安装 agent 本体。
+
+  --deps-only
+      只准备依赖，等价于 --install deps --manual。
+
+  --node-major 24|22
+      选择 NodeSource 大版本。默认 24；Hermes 严格需要 Node 22 时可改为 22。
+
+环境变量:
+  AGENT_APT_UPGRADE=1       依赖安装前执行 dist-upgrade
+  AGENT_INSTALL_DOCKER=0    跳过 Docker
+  AGENT_INSTALL_BROWSER=0   跳过 Playwright 浏览器资源下载
+  HERMES_DIR=/path          指定 Hermes 仓库目录
+EOF
+}
+
+parse_args() {
+    INSTALL_TARGET="menu"
+    ASSUME_YES=0
+    MANUAL_ONLY=0
+    DEPS_ONLY=0
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --install)
+                INSTALL_TARGET="${2:-}"
+                shift 2
+                ;;
+            --install=*)
+                INSTALL_TARGET="${1#*=}"
+                shift
+                ;;
+            --yes|-y)
+                ASSUME_YES=1
+                shift
+                ;;
+            --manual)
+                MANUAL_ONLY=1
+                shift
+                ;;
+            --deps-only)
+                DEPS_ONLY=1
+                INSTALL_TARGET="deps"
+                MANUAL_ONLY=1
+                shift
+                ;;
+            --node-major)
+                AGENT_NODE_MAJOR="${2:-24}"
+                shift 2
+                ;;
+            --node-major=*)
+                AGENT_NODE_MAJOR="${1#*=}"
+                shift
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                log_error "未知参数: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+
+    case "$INSTALL_TARGET" in
+        menu|openclaw|hermes|all|deps|other) ;;
+        *)
+            log_error "无效 --install 目标: ${INSTALL_TARGET}"
+            exit 1
+            ;;
+    esac
+
+    if [ "$DEPS_ONLY" -eq 1 ]; then
+        INSTALL_TARGET="deps"
+        MANUAL_ONLY=1
+    fi
+}
+
+show_banner() {
+    echo -e "${BLUE}"
+    cat <<EOF
+============================================================
+ Debian/Ubuntu AI Agent stable installer ${AGENT_INSTALLER_VERSION}
+ OpenClaw + Hermes Agent + common AI Agent runtime
+============================================================
+EOF
+    echo -e "${NC}"
+    echo "安装流程:"
+    echo "  1. 先在纯净 Debian/Ubuntu 上安装所有依赖和软件"
+    echo "  2. 完成权限、PATH、limits、Docker、浏览器自动化等稳定性优化"
+    echo "  3. 最后再选择马上安装 OpenClaw/Hermes，或按手动步骤安装"
+    echo ""
+}
+
+agent_main() {
+    trap 'error_handler $LINENO' ERR
+    parse_args "$@"
+    require_root
+    init_logging
+    show_banner
+    prepare_all_dependencies
+    show_summary
+
+    if [ "$INSTALL_TARGET" = "menu" ]; then
+        show_final_menu
+    else
+        handle_target_install "$INSTALL_TARGET"
+    fi
+
+    log_success "脚本执行完成"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    agent_main "$@"
+fi
